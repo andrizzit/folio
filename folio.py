@@ -8,12 +8,15 @@ import contextlib
 import datetime as dt
 import fcntl
 import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import selectors
 import secrets
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -26,26 +29,52 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
 
 
 APP_NAME = "Folio"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_CATEGORY = "Inbox"
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
 ALLOWED_FINAL_PHASES = {"final_answer", "final"}
 ENTRY_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{12}Z-[a-f0-9]{10}$")
 CATEGORY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+PROVIDER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+ADAPTER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 MAX_BLOCKQUOTE_DEPTH = 24
 MAX_API_BODY_BYTES = 4096
+MAX_INGEST_BYTES = 10 * 1024 * 1024
+MAX_ENTRY_API_BODY_BYTES = MAX_INGEST_BYTES + 8192
+KNOWN_PROVIDERS = {
+    "codex": "Codex",
+    "claude": "Claude",
+    "grok": "Grok",
+    "chatgpt": "ChatGPT",
+    "gemini": "Gemini",
+    "generic": "Other",
+}
+PROVIDER_ALIASES = {
+    "other": "generic",
+    "markdown": "generic",
+}
+SOURCE_SUPPORT_LEVELS = {"native", "imported"}
+SOURCE_TRANSPORTS = {"session", "file", "stdin", "clipboard", "web", "direct"}
+SERVER_STATE_VERSION = 2
+AUTH_COOKIE_NAME = "folio_session"
 
 
 class FolioError(Exception):
     """Expected user-facing Folio failure."""
+
+
+def auth_cookie_name(instance_id: str) -> str:
+    digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()[:16]
+    return f"{AUTH_COOKIE_NAME}_{digest}"
 
 
 def utc_now() -> dt.datetime:
@@ -184,6 +213,205 @@ def category_id_for(name: str) -> str:
     return f"{slug}-{digest}"
 
 
+def validate_display_label(value: str, field_name: str, maximum: int = 80) -> str:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise FolioError(f"{field_name} cannot be empty.")
+    if len(normalized) > maximum:
+        raise FolioError(f"{field_name} must be {maximum} characters or fewer.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+        raise FolioError(f"{field_name} cannot contain control characters.")
+    return normalized
+
+
+def provider_descriptor(
+    agent: str | None,
+    source_label: str | None = None,
+) -> dict[str, str]:
+    requested = validate_display_label(agent or "generic", "Agent name", 60)
+    known_id = PROVIDER_ALIASES.get(requested.casefold(), requested.casefold())
+    if known_id in KNOWN_PROVIDERS:
+        provider_id = known_id
+        default_label = KNOWN_PROVIDERS[known_id]
+    elif PROVIDER_ID_RE.fullmatch(known_id):
+        provider_id = known_id
+        default_label = requested
+    else:
+        folded = requested.casefold()
+        slug = re.sub(r"[^a-z0-9]+", "-", folded).strip("-")[:30] or "agent"
+        digest = hashlib.sha256(folded.encode("utf-8")).hexdigest()[:10]
+        provider_id = f"{slug}-{digest}"
+        default_label = requested
+    label = (
+        validate_display_label(source_label, "Source label", 60)
+        if source_label is not None
+        else default_label
+    )
+    return {"id": provider_id, "label": label}
+
+
+def source_descriptor(
+    *,
+    agent: str | None,
+    source_label: str | None = None,
+    support_level: str,
+    transport: str,
+    adapter: str,
+    conversation_id: str | None = None,
+    locator: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    provider = provider_descriptor(agent, source_label)
+    if support_level not in SOURCE_SUPPORT_LEVELS:
+        raise FolioError("Source support level is invalid.")
+    if transport not in SOURCE_TRANSPORTS:
+        raise FolioError("Source transport is invalid.")
+    if not ADAPTER_ID_RE.fullmatch(adapter):
+        raise FolioError("Source adapter identifier is invalid.")
+    if support_level == "native":
+        if (
+            provider != {"id": "codex", "label": "Codex"}
+            or transport != "session"
+            or adapter != "codex-session-v1"
+            or conversation_id is None
+        ):
+            raise FolioError(
+                "Native source metadata is reserved for exact Codex session capture."
+            )
+    elif transport == "session" or adapter == "codex-session-v1":
+        raise FolioError("Imported source metadata cannot claim a native session adapter.")
+    value: dict[str, Any] = {
+        "provider": provider["id"],
+        "label": provider["label"],
+        "support_level": support_level,
+        "transport": transport,
+        "adapter": adapter,
+    }
+    if conversation_id is not None:
+        if not THREAD_ID_RE.fullmatch(conversation_id):
+            raise FolioError("Conversation ID contains unsupported characters.")
+        value["conversation_id"] = conversation_id
+    if locator:
+        allowed_locator: dict[str, Any] = {}
+        session_file = locator.get("session_file")
+        if isinstance(session_file, str):
+            safe_name = Path(session_file).name
+            if safe_name == session_file and len(safe_name) <= 255:
+                allowed_locator["session_file"] = safe_name
+        record_line = locator.get("record_line")
+        if isinstance(record_line, int) and record_line > 0:
+            allowed_locator["record_line"] = record_line
+        phase = locator.get("phase")
+        if isinstance(phase, str) and phase in ALLOWED_FINAL_PHASES:
+            allowed_locator["phase"] = phase
+        file_name = locator.get("file_name")
+        if isinstance(file_name, str):
+            safe_name = Path(file_name).name
+            if safe_name == file_name and len(safe_name) <= 255:
+                allowed_locator["file_name"] = safe_name
+        if allowed_locator:
+            value["locator"] = allowed_locator
+    return value
+
+
+def normalize_source_for_storage(source: dict[str, Any] | None) -> dict[str, Any]:
+    if not source:
+        return source_descriptor(
+            agent="generic",
+            support_level="imported",
+            transport="direct",
+            adapter="folio-direct-v1",
+        )
+    if "provider" in source:
+        allowed_keys = {
+            "provider",
+            "label",
+            "support_level",
+            "transport",
+            "adapter",
+            "conversation_id",
+            "locator",
+        }
+        if set(source) - allowed_keys:
+            raise FolioError("Source metadata contains unsupported fields.")
+        provider = source.get("provider")
+        label = source.get("label")
+        support_level = source.get("support_level")
+        transport = source.get("transport")
+        adapter = source.get("adapter")
+        conversation_id = source.get("conversation_id")
+        locator = source.get("locator")
+        if not all(
+            isinstance(value, str)
+            for value in (provider, label, support_level, transport, adapter)
+        ):
+            raise FolioError("Source metadata is invalid.")
+        if conversation_id is not None and not isinstance(conversation_id, str):
+            raise FolioError("Source conversation ID is invalid.")
+        if locator is not None and not isinstance(locator, dict):
+            raise FolioError("Source locator is invalid.")
+        descriptor = source_descriptor(
+            agent=provider,
+            source_label=label,
+            support_level=support_level,
+            transport=transport,
+            adapter=adapter,
+            conversation_id=conversation_id,
+            locator=locator,
+        )
+        if descriptor["provider"] != provider:
+            raise FolioError("Source provider identifier is invalid.")
+        return descriptor
+    kind = source.get("kind")
+    if kind == "codex":
+        allowed_keys = {
+            "kind",
+            "thread_id",
+            "session_file",
+            "record_line",
+            "phase",
+        }
+        if set(source) - allowed_keys:
+            raise FolioError("Legacy Codex source metadata contains unsupported fields.")
+        thread_id = source.get("thread_id")
+        if not isinstance(thread_id, str):
+            raise FolioError("Legacy Codex source thread ID is invalid.")
+        return source_descriptor(
+            agent="codex",
+            support_level="native",
+            transport="session",
+            adapter="codex-session-v1",
+            conversation_id=thread_id,
+            locator=source,
+        )
+    if kind == "file":
+        if set(source) - {"kind", "path"}:
+            raise FolioError("Legacy file source metadata contains unsupported fields.")
+        path_value = source.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            raise FolioError("Legacy file source path is invalid.")
+        file_name = Path(path_value).name
+        return source_descriptor(
+            agent="generic",
+            support_level="imported",
+            transport="file",
+            adapter="folio-file-v1",
+            locator={"file_name": file_name} if file_name else None,
+        )
+    raise FolioError("Source metadata is invalid.")
+
+
+def entry_source(metadata: dict[str, Any]) -> dict[str, Any]:
+    source = metadata.get("source")
+    if isinstance(source, dict):
+        return normalize_source_for_storage(source)
+    raise FolioError("Entry source metadata is invalid.")
+
+
+def source_badge_text(source: dict[str, Any]) -> str:
+    support = "Native" if source["support_level"] == "native" else "Imported"
+    return f"{source['label']} · {support}"
+
+
 def clean_title_text(value: str) -> str:
     value = re.sub(r"`([^`]*)`", r"\1", value)
     value = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", value)
@@ -213,6 +441,28 @@ def derive_title(markdown: str, explicit: str | None = None) -> str:
         if title:
             return title
     return f"Response saved {utc_now().strftime('%Y-%m-%d %H:%M UTC')}"
+
+
+def validate_metadata_title(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise FolioError("Entry title is invalid.")
+    if len(value) > 120:
+        raise FolioError("Entry title is too long.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise FolioError("Entry title contains control characters.")
+    return value
+
+
+def validate_iso_timestamp(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise FolioError("Entry creation timestamp is invalid.")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise FolioError("Entry creation timestamp is invalid.") from error
+    if parsed.tzinfo is None:
+        raise FolioError("Entry creation timestamp must include a timezone.")
+    return value
 
 
 class FolioStore:
@@ -378,6 +628,11 @@ class FolioStore:
             raise FolioError("Markdown source must be text.")
         if not markdown.strip():
             raise FolioError("Markdown source is empty.")
+        if len(markdown.encode("utf-8")) > MAX_INGEST_BYTES:
+            raise FolioError(
+                f"Markdown source exceeds Folio's "
+                f"{MAX_INGEST_BYTES // (1024 * 1024)} MB limit."
+            )
         self.ensure_layout()
         with exclusive_lock(self.lock_path):
             category = self._resolve_category_locked(category_name)
@@ -388,13 +643,13 @@ class FolioStore:
             metadata_path = category_dir / f"{entry_id}.json"
             digest = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
             metadata = {
-                "version": 1,
+                "version": 2,
                 "id": entry_id,
                 "title": derive_title(markdown, title),
                 "category": {"id": category["id"], "name": category["name"]},
                 "created_at": created_at,
                 "sha256": digest,
-                "source": source or {"kind": "file"},
+                "source": normalize_source_for_storage(source),
                 "markdown_file": markdown_path.name,
                 "reader_path": f"/entry/{entry_id}",
             }
@@ -424,6 +679,23 @@ class FolioStore:
             raise FolioError(f"Entry metadata is unreadable: {metadata_path.name}") from error
         if not isinstance(metadata, dict):
             raise FolioError("Entry metadata must be an object.")
+        expected_fields = {
+            "version",
+            "id",
+            "title",
+            "category",
+            "created_at",
+            "sha256",
+            "source",
+            "markdown_file",
+            "reader_path",
+        }
+        allowed_fields = expected_fields | {"updated_at"}
+        if not expected_fields.issubset(metadata) or set(metadata) - allowed_fields:
+            raise FolioError("Entry metadata fields are invalid.")
+        metadata_version = metadata.get("version")
+        if isinstance(metadata_version, bool) or metadata_version not in {1, 2}:
+            raise FolioError("Entry metadata has an unsupported version.")
         entry_id = metadata.get("id")
         if not isinstance(entry_id, str) or not ENTRY_ID_RE.fullmatch(entry_id):
             raise FolioError("Entry metadata has an invalid entry ID.")
@@ -442,22 +714,45 @@ class FolioStore:
         entry_category = metadata.get("category")
         if (
             not isinstance(entry_category, dict)
+            or set(entry_category) != {"id", "name"}
             or entry_category.get("id") != category_dir.name
             or not isinstance(entry_category.get("name"), str)
         ):
             raise FolioError("Entry category metadata is invalid.")
+        if not CATEGORY_ID_RE.fullmatch(entry_category["id"]):
+            raise FolioError("Entry category identifier is invalid.")
+        validate_category_name(entry_category["name"])
+        validate_metadata_title(metadata.get("title"))
+        validate_iso_timestamp(metadata.get("created_at"))
+        if "updated_at" in metadata:
+            validate_iso_timestamp(metadata.get("updated_at"))
+        if metadata.get("reader_path") != f"/entry/{entry_id}":
+            raise FolioError("Entry reader path is invalid.")
+        digest = metadata.get("sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise FolioError("Entry digest is invalid.")
+        source = metadata.get("source")
+        if not isinstance(source, dict):
+            raise FolioError("Entry source metadata is invalid.")
+        normalized_source = normalize_source_for_storage(source)
+        if metadata_version == 2:
+            if normalized_source != source:
+                raise FolioError("Entry source metadata is not canonical.")
         markdown_path = category_dir / expected_markdown_name
         self._safe_regular_file(markdown_path, category_resolved)
         try:
             markdown = markdown_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as error:
             raise FolioError(f"Entry Markdown is unreadable: {markdown_path.name}") from error
+        if hashlib.sha256(markdown.encode("utf-8")).hexdigest() != digest:
+            raise FolioError("Entry Markdown digest does not match its metadata.")
         return metadata, markdown
 
     def load_entries(
         self,
         category_id: str | None = None,
         query: str | None = None,
+        provider_id: str | None = None,
     ) -> list[dict[str, Any]]:
         self.ensure_layout()
         query_folded = (query or "").strip().casefold()
@@ -475,10 +770,15 @@ class FolioStore:
                 entry_category = metadata["category"]
                 if category_id and entry_category["id"] != category_id:
                     continue
+                source = entry_source(metadata)
+                if provider_id and source["provider"] != provider_id:
+                    continue
                 if query_folded:
                     haystack = (
                         f"{metadata.get('title', '')}\n"
-                        f"{entry_category.get('name', '')}\n{markdown}"
+                        f"{entry_category.get('name', '')}\n"
+                        f"{source.get('label', '')}\n"
+                        f"{source_badge_text(source)}\n{markdown}"
                     ).casefold()
                     if query_folded not in haystack:
                         continue
@@ -486,6 +786,7 @@ class FolioStore:
                 value = dict(metadata)
                 value["_markdown"] = markdown
                 value["_summary"] = summary
+                value["_source"] = source
                 entries.append(value)
         entries.sort(key=lambda item: (item.get("created_at", ""), item["id"]), reverse=True)
         return entries
@@ -847,9 +1148,182 @@ def capture_response(thread_id: str | None = None) -> tuple[str, dict[str, Any]]
     if not resolved_thread:
         raise FolioError("No thread ID supplied. Use --thread-id or set CODEX_THREAD_ID.")
     session_path = find_session_file(resolved_thread)
-    markdown, source = extract_latest_final(session_path)
-    source["thread_id"] = resolved_thread
-    return markdown, source
+    markdown, locator = extract_latest_final(session_path)
+    return (
+        markdown,
+        source_descriptor(
+            agent="codex",
+            support_level="native",
+            transport="session",
+            adapter="codex-session-v1",
+            conversation_id=resolved_thread,
+            locator=locator,
+        ),
+    )
+
+
+def capture_agent_response(
+    agent: str,
+    conversation_id: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    provider = provider_descriptor(agent)
+    if provider["id"] != "codex":
+        raise FolioError(
+            f"Folio has no native capture adapter for {provider['label']}. "
+            f"Use 'folio add --clipboard --agent {provider['id']}' or "
+            "'folio add --stdin'."
+        )
+    return capture_response(conversation_id)
+
+
+def decode_ingest_bytes(data: bytes, source_name: str) -> str:
+    if len(data) > MAX_INGEST_BYTES:
+        raise FolioError(
+            f"{source_name} exceeds Folio's {MAX_INGEST_BYTES // (1024 * 1024)} MB limit."
+        )
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise FolioError(f"{source_name} is not valid UTF-8.") from error
+
+
+def read_stdin_markdown(stream: Any | None = None) -> str:
+    active_stream = stream or getattr(sys.stdin, "buffer", sys.stdin)
+    try:
+        value = active_stream.read(MAX_INGEST_BYTES + 1)
+    except OSError as error:
+        raise FolioError(f"Cannot read standard input: {error}") from error
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+        if len(encoded) > MAX_INGEST_BYTES:
+            raise FolioError(
+                f"Standard input exceeds Folio's {MAX_INGEST_BYTES // (1024 * 1024)} MB limit."
+            )
+        return value
+    if not isinstance(value, bytes):
+        raise FolioError("Standard input did not provide text.")
+    return decode_ingest_bytes(value, "Standard input")
+
+
+def read_clipboard_markdown() -> str:
+    candidates = [
+        ("pbpaste", ["pbpaste"]),
+        ("wl-paste", ["wl-paste", "--no-newline"]),
+        ("xclip", ["xclip", "-selection", "clipboard", "-o"]),
+    ]
+    command: list[str] | None = None
+    for executable, candidate in candidates:
+        resolved = shutil.which(executable)
+        if resolved:
+            command = [resolved, *candidate[1:]]
+            break
+    if command is None:
+        raise FolioError(
+            "No supported clipboard reader was found. "
+            "Install pbpaste, wl-paste, or xclip, or use --stdin."
+        )
+    data = read_process_output_bounded(command, "Clipboard content", timeout=8)
+    return decode_ingest_bytes(data, "Clipboard content")
+
+
+def terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=1)
+
+
+def read_process_output_bounded(
+    command: list[str],
+    source_name: str,
+    *,
+    timeout: float,
+) -> bytes:
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError as error:
+        raise FolioError(f"Cannot read {source_name.casefold()}: {error}") from error
+    if process.stdout is None:
+        terminate_process(process)
+        raise FolioError(f"Cannot read {source_name.casefold()}.")
+    chunks: list[bytes] = []
+    total = 0
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        reached_eof = False
+        while not reached_eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_process(process)
+                raise FolioError(f"Timed out while reading {source_name.casefold()}.")
+            events = selector.select(remaining)
+            if not events:
+                terminate_process(process)
+                raise FolioError(f"Timed out while reading {source_name.casefold()}.")
+            for key, _mask in events:
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    reached_eof = True
+                    break
+                total += len(chunk)
+                if total > MAX_INGEST_BYTES:
+                    terminate_process(process)
+                    raise FolioError(
+                        f"{source_name} exceeds Folio's "
+                        f"{MAX_INGEST_BYTES // (1024 * 1024)} MB limit."
+                    )
+                chunks.append(chunk)
+        return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except (OSError, subprocess.TimeoutExpired) as error:
+        terminate_process(process)
+        raise FolioError(f"Cannot read {source_name.casefold()}: {error}") from error
+    finally:
+        selector.close()
+        process.stdout.close()
+    if return_code != 0:
+        raise FolioError(f"Cannot read {source_name.casefold()}.")
+    return b"".join(chunks)
+
+
+def read_markdown_file(source_path: Path) -> tuple[str, Path]:
+    requested = Path(os.path.abspath(source_path.expanduser()))
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(requested, flags)
+    except OSError as error:
+        raise FolioError(f"Cannot open Markdown source safely: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise FolioError("Markdown source is not a regular file.")
+        if metadata.st_size > MAX_INGEST_BYTES:
+            raise FolioError(
+                f"Markdown source exceeds Folio's "
+                f"{MAX_INGEST_BYTES // (1024 * 1024)} MB limit."
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            data = handle.read(MAX_INGEST_BYTES + 1)
+    except OSError as error:
+        raise FolioError(f"Cannot read Markdown source: {error}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return decode_ingest_bytes(data, "Markdown source"), requested
 
 
 def safe_link(url: str) -> str | None:
@@ -1102,14 +1576,25 @@ def format_timestamp(value: str) -> str:
         return value
 
 
-def render_library_page(store: FolioStore, category_id: str | None, query: str) -> str:
+def render_library_page(
+    store: FolioStore,
+    category_id: str | None,
+    query: str,
+    provider_id: str | None = None,
+) -> str:
     categories = store.categories()
-    entries = store.load_entries(category_id=category_id, query=query)
     all_entries = store.load_entries()
+    entries = store.load_entries(
+        category_id=category_id,
+        query=query,
+        provider_id=provider_id,
+    )
     counts: dict[str, int] = {}
+    providers: dict[str, str] = {}
     for entry in all_entries:
         item_category = entry["category"]["id"]
         counts[item_category] = counts.get(item_category, 0) + 1
+        providers[entry["_source"]["provider"]] = entry["_source"]["label"]
     nav_items = [
         (
             None,
@@ -1125,6 +1610,8 @@ def render_library_page(store: FolioStore, category_id: str | None, query: str) 
             params["category"] = nav_id
         if query:
             params["q"] = query
+        if provider_id:
+            params["agent"] = provider_id
         href = "/library"
         if params:
             href += "?" + urllib.parse.urlencode(params)
@@ -1138,6 +1625,12 @@ def render_library_page(store: FolioStore, category_id: str | None, query: str) 
         reader_path = html.escape(entry["reader_path"], quote=True)
         entry_id = html.escape(entry["id"], quote=True)
         entry_title = html.escape(entry["title"], quote=True)
+        source = entry["_source"]
+        source_class = (
+            "source-native"
+            if source["support_level"] == "native"
+            else "source-imported"
+        )
         cards.append(
             f'<article class="entry-card" data-entry-card><a class="entry-card-link" '
             f'href="{reader_path}">'
@@ -1145,6 +1638,8 @@ def render_library_page(store: FolioStore, category_id: str | None, query: str) 
             f'<p class="entry-summary">{html.escape(entry["_summary"] or "Markdown response")}</p>'
             '<div class="entry-meta">'
             f"<span>{html.escape(entry['category']['name'])}</span>"
+            f'<span class="source-badge {source_class}">'
+            f"{html.escape(source_badge_text(source))}</span>"
             f"<time>{html.escape(format_timestamp(entry['created_at']))}</time>"
             "</div></a>"
             '<form class="delete-entry-form" data-delete-entry '
@@ -1164,6 +1659,45 @@ def render_library_page(store: FolioStore, category_id: str | None, query: str) 
         f'<input type="hidden" name="category" value="{html.escape(category_id, quote=True)}">'
         if category_id
         else ""
+    )
+    provider_options = ['<option value="">All agents</option>']
+    for item_id, item_label in sorted(
+        providers.items(),
+        key=lambda item: item[1].casefold(),
+    ):
+        selected = " selected" if item_id == provider_id else ""
+        provider_options.append(
+            f'<option value="{html.escape(item_id, quote=True)}"{selected}>'
+            f"{html.escape(item_label)}</option>"
+        )
+    agent_datalist = "".join(
+        f'<option value="{html.escape(label, quote=True)}"></option>'
+        for label in dict.fromkeys([*KNOWN_PROVIDERS.values(), *providers.values()])
+    )
+    category_datalist = "".join(
+        f'<option value="{html.escape(item["name"], quote=True)}"></option>'
+        for item in categories
+    )
+    add_response_form = (
+        '<details class="add-response-panel"><summary>Add an AI response</summary>'
+        '<form class="add-response-form" data-add-entry>'
+        '<div class="add-response-grid">'
+        '<label>Agent<input name="agent" list="library-agents" value="Other" '
+        'maxlength="60" required autocomplete="off"></label>'
+        f'<datalist id="library-agents">{agent_datalist}</datalist>'
+        '<label>Category<input name="category" list="library-categories" value="Inbox" '
+        'maxlength="80" required autocomplete="off"></label>'
+        f'<datalist id="library-categories">{category_datalist}</datalist>'
+        '<label class="add-response-title">Title <span>(optional)</span>'
+        '<input name="title" maxlength="120" autocomplete="off"></label>'
+        '<label class="add-response-markdown">Response Markdown'
+        '<textarea name="markdown" rows="12" maxlength="10485760" required '
+        'placeholder="Paste a response from Claude, Grok, ChatGPT, Gemini, or another agent">'
+        "</textarea></label></div>"
+        '<div class="add-response-actions">'
+        '<p class="add-response-status" data-add-entry-status role="status" '
+        'aria-live="polite"></p>'
+        '<button type="submit">Save and open</button></div></form></details>'
     )
     selected_category = next(
         (item for item in categories if item["id"] == category_id),
@@ -1193,8 +1727,12 @@ def render_library_page(store: FolioStore, category_id: str | None, query: str) 
         '<form class="search-form" action="/library" method="get" role="search">'
         f"{hidden_category}<label class=\"sr-only\" for=\"search\">Search responses</label>"
         f'<input id="search" name="q" type="search" value="{search_value}" '
-        'placeholder="Search titles and content"><button type="submit">Search</button></form>'
-        f'</div>{delete_category_form}<div class="entry-grid">{"".join(cards)}</div>'
+        'placeholder="Search titles and content">'
+        '<label class="sr-only" for="agent-filter">Filter by agent</label>'
+        f'<select id="agent-filter" name="agent">{"".join(provider_options)}</select>'
+        '<button type="submit">Search</button></form>'
+        f"</div>{add_response_form}{delete_category_form}"
+        f'<div class="entry-grid">{"".join(cards)}</div>'
         "</section></main>"
     )
     return page_shell("Library", body)
@@ -1220,6 +1758,12 @@ def render_entry_page(
     )
     title = metadata.get("title", "Response")
     category = metadata.get("category", {}).get("name", DEFAULT_CATEGORY)
+    source = entry_source(metadata)
+    source_class = (
+        "source-native"
+        if source["support_level"] == "native"
+        else "source-imported"
+    )
     created = format_timestamp(metadata.get("created_at", ""))
     entry_id = metadata.get("id", "")
     category_options = "".join(
@@ -1248,6 +1792,8 @@ def render_entry_page(
         f"<h1>{html.escape(title)}</h1>"
         '<div class="reader-meta">'
         f'<span data-category-label>{html.escape(category)}</span>'
+        f'<span class="source-badge {source_class}">'
+        f"{html.escape(source_badge_text(source))}</span>"
         f"<time>{html.escape(created)}</time>"
         '<button type="button" data-print>Print</button></div></header>'
         f"{category_form}"
@@ -1263,7 +1809,14 @@ class FolioHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    store: FolioStore,
+    instance_id: str,
+    auth_token: str,
+    route_prefix: str,
+) -> type[BaseHTTPRequestHandler]:
+    session_cookie_name = auth_cookie_name(instance_id)
+
     class FolioHandler(BaseHTTPRequestHandler):
         server_version = f"Folio/{VERSION}"
 
@@ -1294,6 +1847,87 @@ def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHan
             }
             return origins[0].strip().casefold() in allowed
 
+        def presented_auth_token(self) -> str | None:
+            authorization = self.headers.get("Authorization", "")
+            if authorization.startswith("Bearer "):
+                return authorization[7:]
+            cookie_header = self.headers.get("Cookie")
+            if not cookie_header:
+                return None
+            try:
+                cookies = SimpleCookie()
+                cookies.load(cookie_header)
+            except Exception:
+                return None
+            cookie = cookies.get(session_cookie_name)
+            return cookie.value if cookie is not None else None
+
+        def authenticated(self) -> bool:
+            presented = self.presented_auth_token()
+            return (
+                isinstance(presented, str)
+                and hmac.compare_digest(presented, auth_token)
+            )
+
+        def send_unauthorized(self) -> None:
+            content = b"Folio authentication required.\n"
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("WWW-Authenticate", 'Bearer realm="Folio"')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(content)
+
+        def establish_browser_session(
+            self,
+            parsed: urllib.parse.SplitResult,
+        ) -> None:
+            parameters = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            supplied = parameters.get("token", [])
+            if (
+                len(supplied) != 1
+                or not hmac.compare_digest(supplied[0], auth_token)
+            ):
+                self.send_unauthorized()
+                return
+            destinations = parameters.get("next", ["/library"])
+            destination = destinations[0] if len(destinations) == 1 else "/library"
+            destination_parts = urllib.parse.urlsplit(destination)
+            if (
+                destination_parts.scheme
+                or destination_parts.netloc
+                or not destination_parts.path.startswith("/")
+                or destination_parts.path.startswith("//")
+                or destination_parts.path == "/auth"
+            ):
+                destination = "/library"
+            scoped_destination = f"{route_prefix}{destination}"
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", scoped_destination)
+            self.send_header(
+                "Set-Cookie",
+                f"{session_cookie_name}={auth_token}; "
+                f"Path={route_prefix}/; HttpOnly; SameSite=Strict",
+            )
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def scoped_request(
+            self,
+            parsed: urllib.parse.SplitResult,
+        ) -> urllib.parse.SplitResult | None:
+            if parsed.path == route_prefix:
+                return parsed._replace(path="/")
+            if not parsed.path.startswith(f"{route_prefix}/"):
+                return None
+            return parsed._replace(path=parsed.path[len(route_prefix) :])
+
         def send_content(
             self,
             status: HTTPStatus,
@@ -1323,7 +1957,21 @@ def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHan
             self.wfile.write(content)
 
         def send_html(self, status: HTTPStatus, value: str) -> None:
-            self.send_content(status, value.encode("utf-8"), "text/html; charset=utf-8")
+            scoped = value.replace(
+                '<html lang="en">',
+                f'<html lang="en" data-folio-base="{route_prefix}">',
+                1,
+            )
+            for attribute in ("href", "src", "action"):
+                scoped = scoped.replace(
+                    f'{attribute}="/',
+                    f'{attribute}="{route_prefix}/',
+                )
+            self.send_content(
+                status,
+                scoped.encode("utf-8"),
+                "text/html; charset=utf-8",
+            )
 
         def send_json(self, status: HTTPStatus, value: Any) -> None:
             self.send_content(status, json_bytes(value), "application/json; charset=utf-8")
@@ -1337,6 +1985,19 @@ def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHan
                 )
                 return
             parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path == "/auth":
+                self.establish_browser_session(parsed)
+                return
+            if not self.authenticated():
+                self.send_unauthorized()
+                return
+            parsed = self.scoped_request(parsed)
+            if parsed is None:
+                self.send_html(
+                    HTTPStatus.NOT_FOUND,
+                    page_shell("Not found", not_found_body()),
+                )
+                return
             if parsed.path == "/health":
                 self.send_json(
                     HTTPStatus.OK,
@@ -1352,11 +2013,21 @@ def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHan
                 parameters = urllib.parse.parse_qs(parsed.query)
                 category = parameters.get("category", [None])[0]
                 query = parameters.get("q", [""])[0][:200]
+                provider = parameters.get("agent", [None])[0]
                 known = {item["id"] for item in store.categories()}
                 if category and category not in known:
                     self.send_html(HTTPStatus.NOT_FOUND, page_shell("Not found", not_found_body()))
                     return
-                self.send_html(HTTPStatus.OK, render_library_page(store, category, query))
+                if provider and not PROVIDER_ID_RE.fullmatch(provider):
+                    self.send_html(
+                        HTTPStatus.NOT_FOUND,
+                        page_shell("Not found", not_found_body()),
+                    )
+                    return
+                self.send_html(
+                    HTTPStatus.OK,
+                    render_library_page(store, category, query, provider),
+                )
                 return
             entry_match = re.fullmatch(r"/entry/([^/]+)", parsed.path)
             if entry_match:
@@ -1406,13 +2077,24 @@ def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHan
                     "text/plain; charset=utf-8",
                 )
                 return
+            if not self.authenticated():
+                self.send_unauthorized()
+                return
+            parsed = urllib.parse.urlsplit(self.path)
+            parsed = self.scoped_request(parsed)
+            if parsed is None:
+                self.send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"status": "error", "error": "Endpoint not found."},
+                )
+                return
             if not self.valid_write_request():
                 self.send_json(
                     HTTPStatus.FORBIDDEN,
                     {"status": "error", "error": "Invalid write request."},
                 )
                 return
-            parsed = urllib.parse.urlsplit(self.path)
+            entry_create = parsed.path == "/api/entry"
             entry_match = re.fullmatch(r"/api/entry/([^/]+)/category", parsed.path)
             entry_delete_match = re.fullmatch(
                 r"/api/entry/([^/]+)/delete",
@@ -1422,7 +2104,12 @@ def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHan
                 r"/api/category/([^/]+)/delete",
                 parsed.path,
             )
-            if not entry_match and not entry_delete_match and not category_delete_match:
+            if (
+                not entry_create
+                and not entry_match
+                and not entry_delete_match
+                and not category_delete_match
+            ):
                 self.send_json(
                     HTTPStatus.NOT_FOUND,
                     {"status": "error", "error": "Endpoint not found."},
@@ -1439,7 +2126,10 @@ def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHan
                 content_length = int(self.headers.get("Content-Length", ""))
             except ValueError:
                 content_length = -1
-            if not 1 <= content_length <= MAX_API_BODY_BYTES:
+            maximum_body = (
+                MAX_ENTRY_API_BODY_BYTES if entry_create else MAX_API_BODY_BYTES
+            )
+            if not 1 <= content_length <= maximum_body:
                 self.send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"status": "error", "error": "Invalid request size."},
@@ -1457,6 +2147,69 @@ def make_handler(store: FolioStore, instance_id: str) -> type[BaseHTTPRequestHan
                 self.send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"status": "error", "error": "JSON request must be an object."},
+                )
+                return
+            if entry_create:
+                allowed_fields = {"markdown", "category", "title", "agent"}
+                if set(payload) - allowed_fields:
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "status": "error",
+                            "error": "Entry request contains unsupported fields.",
+                        },
+                    )
+                    return
+                markdown = payload.get("markdown")
+                category = payload.get("category", DEFAULT_CATEGORY)
+                title = payload.get("title")
+                agent = payload.get("agent", "generic")
+                if not isinstance(markdown, str):
+                    error_message = "Response Markdown must be text."
+                elif not isinstance(category, str):
+                    error_message = "Category must be text."
+                elif title is not None and not isinstance(title, str):
+                    error_message = "Title must be text."
+                elif not isinstance(agent, str):
+                    error_message = "Agent must be text."
+                else:
+                    error_message = ""
+                if error_message:
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"status": "error", "error": error_message},
+                    )
+                    return
+                try:
+                    source = source_descriptor(
+                        agent=agent,
+                        support_level="imported",
+                        transport="web",
+                        adapter="folio-web-v1",
+                    )
+                    saved = store.add_entry(
+                        markdown,
+                        category_name=category,
+                        title=title or None,
+                        source=source,
+                    )
+                except FolioError as error:
+                    self.send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"status": "error", "error": str(error)},
+                    )
+                    return
+                metadata = saved["metadata"]
+                self.send_json(
+                    HTTPStatus.CREATED,
+                    {
+                        "status": "saved",
+                        "entry_id": metadata["id"],
+                        "title": metadata["title"],
+                        "category": metadata["category"]["name"],
+                        "agent": metadata["source"]["label"],
+                        "reader_path": metadata["reader_path"],
+                    },
                 )
                 return
             if category_delete_match:
@@ -1570,6 +2323,18 @@ def read_server_state(store: FolioStore) -> dict[str, Any] | None:
         return None
     if not isinstance(value.get("instance_id"), str):
         return None
+    auth_token = value.get("auth_token")
+    if auth_token is not None and not isinstance(auth_token, str):
+        return None
+    app_version = value.get("app_version")
+    if app_version is not None and not isinstance(app_version, str):
+        return None
+    route_prefix = value.get("route_prefix")
+    if route_prefix is not None and (
+        not isinstance(route_prefix, str)
+        or not re.fullmatch(r"/s/[A-Za-z0-9_-]{16,80}", route_prefix)
+    ):
+        return None
     return value
 
 
@@ -1578,8 +2343,21 @@ def health_for_state(state: dict[str, Any], timeout: float = 0.35) -> dict[str, 
     if not isinstance(port, int) or not (1 <= port <= 65535):
         return None
     try:
+        route_prefix = state.get("route_prefix")
+        health_path = (
+            f"{route_prefix}/health"
+            if isinstance(route_prefix, str)
+            else "/health"
+        )
+        request = urllib.request.Request(
+            f"http://{LOOPBACK_HOST}:{port}{health_path}",
+        )
+        auth_token = state.get("auth_token")
+        if isinstance(auth_token, str):
+            request.add_header("Authorization", f"Bearer {auth_token}")
         with urllib.request.urlopen(
-            f"http://{LOOPBACK_HOST}:{port}/health", timeout=timeout
+            request,
+            timeout=timeout,
         ) as response:
             value = json.loads(response.read().decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, urllib.error.URLError):
@@ -1593,11 +2371,56 @@ def health_for_state(state: dict[str, Any], timeout: float = 0.35) -> dict[str, 
     return None
 
 
+def current_server_matches(
+    state: dict[str, Any],
+    health: dict[str, Any],
+) -> bool:
+    return (
+        state.get("version") == SERVER_STATE_VERSION
+        and state.get("app_version") == VERSION
+        and isinstance(state.get("auth_token"), str)
+        and isinstance(state.get("route_prefix"), str)
+        and health.get("version") == VERSION
+    )
+
+
+def server_browser_url(state: dict[str, Any], destination: str) -> str:
+    port = state["port"]
+    token = state.get("auth_token")
+    if not isinstance(token, str):
+        return f"http://{LOOPBACK_HOST}:{port}{destination}"
+    query = urllib.parse.urlencode({"token": token, "next": destination})
+    return f"http://{LOOPBACK_HOST}:{port}/auth?{query}"
+
+
 def remove_state_if_owned(store: FolioStore, instance_id: str) -> None:
     state = read_server_state(store)
     if state and state.get("instance_id") == instance_id:
         with contextlib.suppress(FileNotFoundError):
             store.server_state_path.unlink()
+
+
+def stop_verified_server(
+    store: FolioStore,
+    state: dict[str, Any],
+    timeout: float = 4.0,
+) -> bool:
+    if not health_for_state(state):
+        return False
+    try:
+        os.kill(state["pid"], signal.SIGTERM)
+    except ProcessLookupError:
+        with contextlib.suppress(FileNotFoundError):
+            store.server_state_path.unlink()
+        return True
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not health_for_state(state, timeout=0.15):
+            with contextlib.suppress(FileNotFoundError):
+                store.server_state_path.unlink()
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def run_server(store: FolioStore, port: int) -> None:
@@ -1613,20 +2436,25 @@ def run_server(store: FolioStore, port: int) -> None:
         with contextlib.suppress(FileNotFoundError):
             store.server_state_path.unlink()
     instance_id = secrets.token_urlsafe(18)
+    auth_token = secrets.token_urlsafe(32)
+    route_prefix = f"/s/{instance_id}"
     try:
         server = FolioHTTPServer(
             (LOOPBACK_HOST, port),
-            make_handler(store, instance_id),
+            make_handler(store, instance_id, auth_token, route_prefix),
         )
     except OSError as error:
         raise FolioError(f"Cannot bind Folio server on loopback: {error}") from error
     actual_port = server.server_address[1]
     state = {
-        "version": 1,
+        "version": SERVER_STATE_VERSION,
+        "app_version": VERSION,
         "pid": os.getpid(),
         "host": LOOPBACK_HOST,
         "port": actual_port,
         "instance_id": instance_id,
+        "auth_token": auth_token,
+        "route_prefix": route_prefix,
         "started_at": iso_now(),
     }
     atomic_write(store.server_state_path, json_bytes(state))
@@ -1637,7 +2465,14 @@ def run_server(store: FolioStore, port: int) -> None:
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, request_shutdown)
         signal.signal(signal.SIGINT, request_shutdown)
-    print(json.dumps({"status": "serving", "url": f"http://{LOOPBACK_HOST}:{actual_port}"}))
+    print(
+        json.dumps(
+            {
+                "status": "serving",
+                "url": server_browser_url(state, "/library"),
+            }
+        )
+    )
     try:
         server.serve_forever(poll_interval=0.2)
     finally:
@@ -1649,8 +2484,12 @@ def ensure_server(store: FolioStore, timeout: float = 6.0) -> dict[str, Any]:
     store.ensure_layout()
     with exclusive_lock(store.server_lock_path):
         state = read_server_state(store)
-        if state and health_for_state(state):
-            return state
+        if state:
+            health = health_for_state(state)
+            if health and current_server_matches(state, health):
+                return state
+            if health and not stop_verified_server(store, state):
+                raise FolioError("An older Folio server did not stop during upgrade.")
         if state:
             with contextlib.suppress(FileNotFoundError):
                 store.server_state_path.unlink()
@@ -1672,8 +2511,10 @@ def ensure_server(store: FolioStore, timeout: float = 6.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             state = read_server_state(store)
-            if state and health_for_state(state):
-                return state
+            if state:
+                health = health_for_state(state)
+                if health and current_server_matches(state, health):
+                    return state
             time.sleep(0.05)
     raise FolioError(f"Folio server did not start. See {store.run_dir / 'server.log'}.")
 
@@ -1695,30 +2536,22 @@ def stop_server(store: FolioStore, timeout: float = 4.0) -> dict[str, Any]:
         with contextlib.suppress(FileNotFoundError):
             store.server_state_path.unlink()
         return {"status": "stopped", "was_running": False, "recovered_stale_state": True}
-    pid = state["pid"]
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        with contextlib.suppress(FileNotFoundError):
-            store.server_state_path.unlink()
-        return {"status": "stopped", "was_running": False, "recovered_stale_state": True}
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not health_for_state(state, timeout=0.15):
-            return {"status": "stopped", "was_running": True}
-        time.sleep(0.05)
+    if stop_verified_server(store, state, timeout=timeout):
+        return {"status": "stopped", "was_running": True}
     raise FolioError("Folio server did not stop after SIGTERM.")
 
 
 def status_payload(store: FolioStore) -> dict[str, Any]:
     state = read_server_state(store)
-    if state and health_for_state(state):
+    health = health_for_state(state) if state else None
+    if state and health:
         return {
             "status": "running",
             "pid": state["pid"],
             "host": state["host"],
             "port": state["port"],
-            "url": f"http://{LOOPBACK_HOST}:{state['port']}",
+            "version": health.get("version"),
+            "url": server_browser_url(state, "/library"),
             "started_at": state.get("started_at"),
         }
     stale = state is not None
@@ -1735,6 +2568,7 @@ def doctor_payload(store: FolioStore) -> dict[str, Any]:
             "name": "python",
             "ok": sys.version_info >= (3, 11),
             "detail": sys.version.split()[0],
+            "required": True,
         }
     )
     static_missing = [
@@ -1745,6 +2579,7 @@ def doctor_payload(store: FolioStore) -> dict[str, Any]:
             "name": "static_assets",
             "ok": not static_missing,
             "detail": "available" if not static_missing else f"missing: {', '.join(static_missing)}",
+            "required": True,
         }
     )
     try:
@@ -1761,13 +2596,21 @@ def doctor_payload(store: FolioStore) -> dict[str, Any]:
     except OSError as error:
         home_ok = False
         home_detail = str(error)
-    checks.append({"name": "folio_home", "ok": home_ok, "detail": home_detail})
+    checks.append(
+        {
+            "name": "folio_home",
+            "ok": home_ok,
+            "detail": home_detail,
+            "required": True,
+        }
+    )
     root = sessions_root()
     checks.append(
         {
-            "name": "codex_sessions",
+            "name": "codex_adapter",
             "ok": root.is_dir() and os.access(root, os.R_OK),
             "detail": str(root),
+            "required": False,
         }
     )
     try:
@@ -1778,9 +2621,20 @@ def doctor_payload(store: FolioStore) -> dict[str, Any]:
     except OSError as error:
         loopback_ok = False
         loopback_detail = str(error)
-    checks.append({"name": "loopback_bind", "ok": loopback_ok, "detail": loopback_detail})
+    checks.append(
+        {
+            "name": "loopback_bind",
+            "ok": loopback_ok,
+            "detail": loopback_detail,
+            "required": True,
+        }
+    )
     return {
-        "status": "ok" if all(check["ok"] for check in checks) else "issues",
+        "status": (
+            "ok"
+            if all(check["ok"] for check in checks if check["required"])
+            else "issues"
+        ),
         "checks": checks,
         "folio_home": str(store.home),
     }
@@ -1799,19 +2653,32 @@ def positive_port(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="folio",
-        description="Save Codex responses to a private local Markdown library.",
+        description="Save AI responses to a private local Markdown library.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    capture = commands.add_parser("capture", help="Capture the latest final Codex response.")
+    capture = commands.add_parser(
+        "capture",
+        help="Capture through an available native agent adapter.",
+    )
+    capture.add_argument("--agent", default="codex")
     capture.add_argument("--category", default=DEFAULT_CATEGORY)
     capture.add_argument("--title")
+    capture.add_argument("--conversation-id")
     capture.add_argument("--thread-id")
     capture.add_argument("--no-open", action="store_true")
 
-    add = commands.add_parser("add", help="Add an explicit Markdown file.")
-    add.add_argument("--source", type=Path, required=True)
+    add = commands.add_parser(
+        "add",
+        help="Import AI response Markdown from a file, stdin, or clipboard.",
+    )
+    add_source = add.add_mutually_exclusive_group(required=True)
+    add_source.add_argument("--source", type=Path)
+    add_source.add_argument("--stdin", action="store_true")
+    add_source.add_argument("--clipboard", action="store_true")
+    add.add_argument("--agent", default="generic")
+    add.add_argument("--source-label")
     add.add_argument("--category", default=DEFAULT_CATEGORY)
     add.add_argument("--title")
     add.add_argument("--no-open", action="store_true")
@@ -1838,13 +2705,15 @@ def entry_command_result(
 ) -> dict[str, Any]:
     saved = store.add_entry(markdown, category_name=category, title=title, source=source)
     state = ensure_server(store)
-    url = f"http://{LOOPBACK_HOST}:{state['port']}{saved['metadata']['reader_path']}"
+    url = server_browser_url(state, saved["metadata"]["reader_path"])
     opened = open_local_url(url, no_open)
     return {
         "status": "saved",
         "entry_id": saved["metadata"]["id"],
         "title": saved["metadata"]["title"],
         "category": saved["metadata"]["category"]["name"],
+        "agent": saved["metadata"]["source"]["label"],
+        "source": source_badge_text(saved["metadata"]["source"]),
         "markdown_path": saved["markdown_path"],
         "metadata_path": saved["metadata_path"],
         "url": url,
@@ -1854,25 +2723,47 @@ def entry_command_result(
 
 def execute(args: argparse.Namespace, store: FolioStore) -> dict[str, Any] | None:
     if args.command == "capture":
-        markdown, source = capture_response(args.thread_id)
+        if (
+            args.conversation_id
+            and args.thread_id
+            and args.conversation_id != args.thread_id
+        ):
+            raise FolioError("--conversation-id and --thread-id must match.")
+        conversation_id = args.conversation_id or args.thread_id
+        markdown, source = capture_agent_response(args.agent, conversation_id)
         return entry_command_result(
             store, markdown, args.category, args.title, source, args.no_open
         )
     if args.command == "add":
-        source_path = args.source.expanduser().resolve()
-        if not source_path.is_file():
-            raise FolioError(f"Markdown source does not exist: {source_path}")
-        try:
-            markdown = source_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            raise FolioError(f"Cannot read Markdown source: {error}") from error
-        source = {"kind": "file", "path": str(source_path)}
+        if args.source is not None:
+            markdown, source_path = read_markdown_file(args.source)
+            transport = "file"
+            locator = {"file_name": source_path.name}
+            adapter = "folio-file-v1"
+        elif args.stdin:
+            markdown = read_stdin_markdown()
+            transport = "stdin"
+            locator = None
+            adapter = "folio-stdin-v1"
+        else:
+            markdown = read_clipboard_markdown()
+            transport = "clipboard"
+            locator = None
+            adapter = "folio-clipboard-v1"
+        source = source_descriptor(
+            agent=args.agent,
+            source_label=args.source_label,
+            support_level="imported",
+            transport=transport,
+            adapter=adapter,
+            locator=locator,
+        )
         return entry_command_result(
             store, markdown, args.category, args.title, source, args.no_open
         )
     if args.command == "library":
         state = ensure_server(store)
-        url = f"http://{LOOPBACK_HOST}:{state['port']}/library"
+        url = server_browser_url(state, "/library")
         return {
             "status": "ready",
             "url": url,

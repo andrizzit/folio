@@ -1,26 +1,46 @@
 # Folio
 
-Folio turns completed Codex responses and explicit Markdown files into a private,
-durable local library with a readable browser interface.
+Folio 0.3.0 is a private local reading library for AI responses and Markdown.
+It saves content as durable Markdown and renders it in a readable browser
+interface.
 
-Its mark is a folio page containing a terminal prompt:
+Codex has native exact-response capture. Responses from Claude, Grok, ChatGPT,
+Gemini, and other tools are manual imports through a file, stdin, the system
+clipboard, or the web library. Imported provider labels are user-supplied and
+are never presented as native or verified provenance.
+
+Folio's mark is a folio page containing a terminal prompt:
 
 ```text
 ▤  Folio
 ```
 
-Folio is a Python standard-library application. It has no package-manager
-installation, cloud service, account, telemetry, database, or frontend build.
-The web server binds only to `127.0.0.1`.
+Folio uses only the Python standard library. It has no provider API
+integration, accounts, provider credentials, telemetry, cloud service,
+database, frontend build, hooks, or permanently installed background daemon.
+Its web server binds only to `127.0.0.1`, starts lazily, and is reused until
+stopped or the process exits.
 
-## Requirements
+## Support
 
-- Python 3.11 or newer (developed on Python 3.14)
+| Source | How content enters Folio | Library label |
+| --- | --- | --- |
+| Codex CLI | Native exact capture with `folio` or `folio capture` | Codex · Native |
+| Claude | File, stdin, clipboard, or web paste | Claude · Imported |
+| Grok | File, stdin, clipboard, or web paste | Grok · Imported |
+| ChatGPT | File, stdin, clipboard, or web paste | ChatGPT · Imported |
+| Gemini | File, stdin, clipboard, or web paste | Gemini · Imported |
+| Other or custom source | File, stdin, clipboard, or web paste | User-supplied label · Imported |
+
+Categories remain flat and independent from providers. The library can filter
+by provider without changing an entry's category.
+
+## Requirements and installation
+
+- Python 3.11 or newer
 - macOS or another Unix-like system with `fcntl`
 
-## Install
-
-Clone or copy this repository, then run:
+Clone or copy the repository, then run:
 
 ```bash
 ./install.sh
@@ -29,9 +49,9 @@ Clone or copy this repository, then run:
 The installer links `folio` into `~/.local/bin` and copies the optional Codex
 skill into `~/.codex/skills/folio`. Ensure `~/.local/bin` is on `PATH`.
 
-## Commands
+## Codex fast path
 
-Inside the Codex CLI, use its direct shell-command prefix for the fastest path:
+Inside the Codex CLI, use its direct shell-command prefix:
 
 ```text
 !folio
@@ -39,17 +59,43 @@ Inside the Codex CLI, use its direct shell-command prefix for the fastest path:
 !folio library
 ```
 
-These commands execute Folio directly without an agent/model turn. The
-`$folio` skill remains available when natural-language interpretation is more
-useful. Folio intentionally does not install a custom `/folio` prompt because
-custom prompts still require an agent/model turn; `!folio` is the fast path.
+`!folio` executes Folio directly without an additional agent/model turn. The
+optional `$folio` skill supports natural-language requests, but it is not the
+fast path.
 
-The executable interface is:
+`folio` and `folio capture` save the exact preceding completed Codex response.
+Capture fails closed if Folio cannot identify one unambiguous completed
+response; it never reconstructs an answer from memory or captures commentary.
+
+## Manual imports
+
+`folio add` accepts exactly one input method: `--source FILE`, `--stdin`, or
+`--clipboard`. Use `--agent` to identify the source and optionally
+`--source-label` to control its display name.
 
 ```bash
+folio add --source response.md --agent claude --category "Research"
+agent-command --markdown | folio add --stdin --agent grok
+folio add --clipboard --agent chatgpt --title "Design review"
+folio add --source answer.md --agent custom --source-label "Local model"
+```
+
+Clipboard access occurs only after an explicit `--clipboard` invocation. New
+file imports retain only the source basename in metadata, not the absolute
+input path.
+
+To paste content in the browser, run `folio library` and use the import form.
+Choose a provider or enter a custom label before saving. Browser-pasted content
+is also marked as imported.
+
+## Commands
+
+```bash
+folio
 folio capture --no-open
-folio capture --category "Project Alpha" --title "API notes"
-folio add --source response.md --category "Research" --no-open
+folio add --source response.md --agent claude --no-open
+folio add --stdin --agent grok
+folio add --clipboard --agent chatgpt
 folio library --no-open
 folio serve --port 8765
 folio status
@@ -57,19 +103,30 @@ folio stop
 folio doctor
 ```
 
-`capture` requires either `--thread-id ID` or `CODEX_THREAD_ID`. It searches
-read-only beneath `~/.codex/sessions`. A candidate must contain the thread ID in
-its filename, be a non-symlink regular file contained beneath the resolved
-sessions root, and declare the exact same ID in `session_meta`. Folio requires
-exactly one such JSONL session and saves the latest completed assistant message
-whose phase is `final_answer`. The older `final` phase is accepted as a
-compatibility alias; commentary is never captured.
+`add`, `capture`, and `library` start or reuse the loopback-only server and
+open the relevant page unless `--no-open` is present. `folio stop` shuts it
+down. The next applicable command starts it again; Folio does not install an
+always-on system service.
 
-`add`, `capture`, and `library` start or reuse a detached local server. They
-open the relevant page unless `--no-open` is present. All commands print JSON,
-including the durable source path and local reader URL.
+Commands print JSON containing the saved entry details and local reader URL.
 
-## Data
+## Library
+
+The web library provides:
+
+- readable response pages with light and dark themes;
+- provider badges and provider filtering;
+- title and content search;
+- flat categories, category creation, and category moves;
+- category deletion that first moves its entries to Inbox;
+- confirmed permanent response deletion;
+- code copy controls, tables of contents, print styles, and safe Markdown.
+
+Existing Folio entries remain readable. New entries use the cross-agent source
+metadata while legacy Codex and file-import metadata is normalized when read,
+without rewriting the library at startup.
+
+## Data and privacy
 
 The default data directory is:
 
@@ -81,74 +138,37 @@ The default data directory is:
 │   │   ├── <entry-id>.md
 │   │   └── <entry-id>.json
 │   └── <flat-category-id>/
-│       └── ...
 ├── locks/
 └── run/
     ├── server.json
     └── server.log
 ```
 
-Set `FOLIO_HOME` to use another location. Tests always use an isolated
-temporary directory. `FOLIO_CODEX_SESSIONS` can point capture tests at fixture
-sessions without touching the real Codex directory.
+Set `FOLIO_HOME` to use another location. Saved responses are not stored in the
+Git repository.
 
-Each capture creates a new immutable Markdown entry, even when content is
-identical. Adjacent JSON stores the title, display category, creation time,
-source thread and JSONL line, SHA-256, and stable `/entry/<id>` reader path.
-Category display names never become raw paths. Categories are flat,
-case-insensitively unique, and reject `/` and `\`.
+Folio escapes raw HTML, restricts active links to `http`, `https`, and
+`mailto`, serves no external assets, and does not expose arbitrary local
+files. The server rejects non-loopback Host headers and uses restrictive
+browser security headers. Every content and API route requires a random
+per-server capability token. Folio stores that token in its private
+`server.json`, uses it in a browser bootstrap URL, then redirects into an
+unguessable per-instance path with a per-instance HttpOnly, same-site session
+cookie scoped to that path. This prevents old Folio cookies from shadowing the
+current session and prevents the browser from sending the token to unrelated
+localhost services. Category changes, imports, and deletions additionally
+require same-origin requests.
 
-Writes are serialized with `flock`, flushed with `fsync`, and committed with
-atomic replacement. An orphaned Markdown file from an interrupted metadata
-write is ignored by the library scanner. Folio validates every category,
-metadata, and Markdown path before reading it. Entry Markdown must be exactly
-`<validated-entry-id>.md` in a direct, non-symlink category directory.
+Treat a printed Folio URL as private while that server instance is running:
+the bootstrap URL grants access to the local library, but is never sent to an
+AI provider or external service.
 
-Folio creates and migrates its data, category, run, and lock directories to
-mode `0700`. Markdown, metadata, state, log, and lock files use mode `0600`.
-
-## Reader and security
-
-The server renders HTML on demand and provides:
-
-- newest-first response cards;
-- flat category navigation and title/content search;
-- category moves from the response reader, including creation of a new flat
-  category by typing its name;
-- category deletion from the library, with every saved response moved safely
-  to Inbox before the category is removed;
-- confirmed permanent response deletion from library cards;
-- readable prose width, responsive tables, and horizontally scrolling code;
-- code copy controls, heading links, table of contents, print CSS, and
-  persistent light/dark theme;
-- headings, paragraphs, emphasis, inline and fenced code, lists, blockquotes,
-  links, and simple tables.
-
-Raw HTML is escaped. Links are active only for `http`, `https`, and `mailto`.
-Responses include a restrictive Content Security Policy, no external assets,
-no executable response HTML, and no route that exposes arbitrary local files.
-Every request must carry a Host header containing `127.0.0.1` or `localhost`
-with Folio's active port. Responses also set same-origin resource isolation and
-a restrictive Permissions Policy. Category changes require a same-origin JSON
-request with Folio's custom request header. Request logging is disabled so
-searches cannot enter the server log.
-
-Server state contains a random instance identifier. Status and stop operations
-validate that identifier against loopback health before trusting a PID, which
-avoids signalling a process referenced by a stale or reused PID file.
+Library paths and identifiers are validated before use. Writes are serialized,
+flushed, and atomically replaced. Folio keeps its data private with directory
+mode `0700` and file mode `0600`.
 
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-
-Coverage includes immutable storage, category validation, search ordering,
-safe Markdown, malicious links and HTML, canonical `final_answer` capture,
-commentary exclusion, compatibility with `final`, capture ambiguity/schema
-failures, wrong-thread and symlink rejection, read-only fixture capture,
-metadata path containment, symlinked Markdown rejection, private permission
-migration, bounded deeply nested blockquotes, safe category deletion, confirmed
-response deletion, hostile Host rejection, silent request handling, HTTP
-health/library/reader/static routes, security headers, 404 behavior, and stale
-server-state recovery.

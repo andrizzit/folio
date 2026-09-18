@@ -16,7 +16,7 @@ case "${1:-}" in
   "")
     set -- capture
     ;;
-  --category|--title|--thread-id|--no-open)
+  --agent|--category|--title|--conversation-id|--thread-id|--no-open)
     set -- capture "$@"
     ;;
 esac

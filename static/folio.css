@@ -49,7 +49,9 @@ a {
 }
 
 button,
-input {
+input,
+select,
+textarea {
   font: inherit;
 }
 
@@ -217,12 +219,13 @@ button:focus-visible {
 
 .search-form {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
-  width: min(100%, 430px);
+  width: min(100%, 620px);
 }
 
-.search-form input {
-  width: 100%;
+.search-form input,
+.search-form select {
   min-height: 44px;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -231,8 +234,116 @@ button:focus-visible {
   color: var(--ink);
 }
 
+.search-form input {
+  flex: 1 1 230px;
+  width: 100%;
+}
+
+.search-form select {
+  flex: 0 1 160px;
+  width: auto;
+  min-width: 128px;
+}
+
 .search-form button {
   padding: 8px 14px;
+}
+
+.add-response-panel {
+  margin: -10px 0 28px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.add-response-panel summary {
+  padding: 15px 18px;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 720;
+}
+
+.add-response-panel[open] summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.add-response-form {
+  padding: 18px;
+}
+
+.add-response-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.add-response-form label {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 720;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.add-response-form label span {
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.add-response-form input,
+.add-response-form textarea {
+  display: block;
+  width: 100%;
+  margin-top: 7px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 10px 12px;
+  background: var(--paper);
+  color: var(--ink);
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.add-response-form input {
+  min-height: 44px;
+}
+
+.add-response-form textarea {
+  min-height: 220px;
+  resize: vertical;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  line-height: 1.5;
+}
+
+.add-response-title,
+.add-response-markdown {
+  grid-column: 1 / -1;
+}
+
+.add-response-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.add-response-actions button {
+  padding: 8px 16px;
+}
+
+.add-response-actions button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.add-response-status {
+  flex: 1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
 }
 
 .delete-category-form {
@@ -341,6 +452,29 @@ button:focus-visible {
   padding-top: 22px;
   color: var(--muted);
   font-size: 0.84rem;
+}
+
+.source-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.source-native {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.source-imported {
+  background: var(--paper);
+  color: var(--muted);
 }
 
 .delete-entry-form {
@@ -767,6 +901,19 @@ th {
     margin-top: 22px;
   }
 
+  .search-form select {
+    min-width: 0;
+  }
+
+  .add-response-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .add-response-title,
+  .add-response-markdown {
+    grid-column: auto;
+  }
+
   .delete-category-form {
     display: block;
     margin-top: -8px;
@@ -819,6 +966,7 @@ th {
   .toc,
   .back-link,
   .reader-meta button,
+  .add-response-panel,
   .delete-category-form,
   .delete-entry-form,
   .code-toolbar button,

@@ -1,10 +1,10 @@
 interface:
   display_name: "Folio"
-  short_description: "Save Codex responses in a local reading library"
+  short_description: "Save and import AI responses into a local library"
   icon_small: "./assets/folio-small.svg"
   icon_large: "./assets/folio.svg"
   brand_color: "#0F766E"
-  default_prompt: "Use $folio to save and open the immediately preceding Codex response."
+  default_prompt: "Use $folio to save the preceding Codex response, browse the library, or import explicitly supplied content."
 
 policy:
   allow_implicit_invocation: true
